@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 from infer.module import attentions, commons, modules
 from infer.module.commons import get_padding, init_weights
+from infer.module.refinegan import RefineGANGenerator
 
 class TextEncoder(nn.Module):
     def __init__(
@@ -752,6 +753,106 @@ class SynthesizerTrnMs768NSFsid(SynthesizerTrnMs256NSFsid):
             kernel_size,
             float(p_dropout),
         )
+
+
+class SynthesizerTrnMs768NSFsidRefineGAN(SynthesizerTrnMs768NSFsid):
+    def __init__(
+        self,
+        spec_channels,
+        segment_size,
+        inter_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        spk_embed_dim,
+        gin_channels,
+        sr,
+        **kwargs
+    ):
+        super(SynthesizerTrnMs768NSFsidRefineGAN, self).__init__(
+            spec_channels,
+            segment_size,
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            p_dropout,
+            resblock,
+            resblock_kernel_sizes,
+            resblock_dilation_sizes,
+            upsample_rates,
+            upsample_initial_channel,
+            upsample_kernel_sizes,
+            spk_embed_dim,
+            gin_channels,
+            sr,
+            **kwargs
+        )
+        if isinstance(sr, str):
+            sr = sr2sr[sr]
+        self.dec = RefineGANGenerator(
+            sample_rate=sr,
+            upsample_rates=upsample_rates,
+            num_mels=inter_channels,
+            gin_channels=gin_channels,
+        )
+
+    def infer(
+        self,
+        phone,
+        phone_lengths,
+        pitch,
+        nsff0,
+        sid,
+        skip_head=None,
+        return_length=None,
+        return_length2=None,
+    ):
+        g = self.emb_g(sid).unsqueeze(-1)
+        if skip_head is not None and return_length is not None:
+            head = int(skip_head.item()) if isinstance(skip_head, torch.Tensor) else int(skip_head)
+            length = (
+                int(return_length.item())
+                if isinstance(return_length, torch.Tensor)
+                else int(return_length)
+            )
+            flow_head = max(head - 24, 0)
+            dec_head = head - flow_head
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, flow_head)
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+            z = z[:, :, dec_head : dec_head + length]
+            x_mask = x_mask[:, :, dec_head : dec_head + length]
+            nsff0 = nsff0[:, head : head + length]
+        else:
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+        z = z * x_mask
+        # RefineGANGenerator has no n_res hook like GeneratorNSF, so formant shift is
+        # reproduced here by resizing the latent and f0 curve before decoding instead.
+        if return_length2 is not None:
+            return_length2 = (
+                int(return_length2.item())
+                if isinstance(return_length2, torch.Tensor)
+                else int(return_length2)
+            )
+            if return_length2 != z.shape[-1]:
+                z = F.interpolate(z, size=return_length2, mode="linear")
+                nsff0 = F.interpolate(nsff0.unsqueeze(1), size=return_length2, mode="linear").squeeze(1)
+        o = self.dec(z, nsff0, g=g)
+        return o, x_mask, (z, z_p, m_p, logs_p)
 
 
 class SynthesizerTrnMs256NSFsid_nono(nn.Module):

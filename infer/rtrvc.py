@@ -29,12 +29,14 @@ def get_synthesizer(pth_path, device=torch.device("cpu")):
         SynthesizerTrnMs256NSFsid_nono,
         SynthesizerTrnMs768NSFsid,
         SynthesizerTrnMs768NSFsid_nono,
+        SynthesizerTrnMs768NSFsidRefineGAN,
     )
 
     cpt = torch.load(pth_path, map_location=torch.device("cpu"))
     cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
     if_f0 = cpt.get("f0", 1)
     version = cpt.get("version", "v1")
+    vocoder = cpt.get("vocoder", "HiFi-GAN")
     if version == "v1":
         if if_f0 == 1:
             net_g = SynthesizerTrnMs256NSFsid(*cpt["config"], is_half=False)
@@ -42,7 +44,10 @@ def get_synthesizer(pth_path, device=torch.device("cpu")):
             net_g = SynthesizerTrnMs256NSFsid_nono(*cpt["config"])
     elif version == "v2":
         if if_f0 == 1:
-            net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=False)
+            if vocoder == "RefineGAN":
+                net_g = SynthesizerTrnMs768NSFsidRefineGAN(*cpt["config"], is_half=False)
+            else:
+                net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=False)
         else:
             net_g = SynthesizerTrnMs768NSFsid_nono(*cpt["config"])
     del net_g.enc_q
