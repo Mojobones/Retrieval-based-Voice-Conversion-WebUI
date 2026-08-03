@@ -8,7 +8,7 @@
 #define PLUG_MFR_ID 'Rvcp'
 #define PLUG_URL_STR "https://github.com/iPlug2/iPlug2"
 #define PLUG_EMAIL_STR ""
-#define PLUG_COPYRIGHT_STR "Copyright 2026 RVC Realtime contributors"
+#define PLUG_COPYRIGHT_STR "Copyright 2026 RVC-BOSS"
 #define PLUG_CLASS_NAME RVCRealtime
 
 #define BUNDLE_NAME "RVCRealtime"
