@@ -108,10 +108,21 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
     else:
         state_dict = model.state_dict()
     new_state_dict = {}
+    embedding_resized = False
     for k, v in state_dict.items():  # 模型需要的shape
         try:
             new_state_dict[k] = saved_state_dict[k]
             if saved_state_dict[k].shape != state_dict[k].shape:
+                if (
+                    k == "emb_g.weight"
+                    and saved_state_dict[k].dim() == state_dict[k].dim()
+                    and saved_state_dict[k].shape[1:] == state_dict[k].shape[1:]
+                ):
+                    new_state_dict[k] = v.clone()
+                    rows = min(saved_state_dict[k].shape[0], state_dict[k].shape[0])
+                    new_state_dict[k][:rows].copy_(saved_state_dict[k][:rows])
+                    embedding_resized = True
+                    continue
                 logger.warning(
                     "shape-%s-mismatch|need-%s|get-%s",
                     k,
@@ -132,7 +143,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
     iteration = checkpoint_dict["iteration"]
     learning_rate = checkpoint_dict["learning_rate"]
     if (
-        optimizer is not None and load_opt == 1
+        optimizer is not None and load_opt == 1 and not embedding_resized
     ):  ###加载不了，如果是空的的话，重新初始化，可能还会影响lr时间表的更新，因此在train文件最外围catch
         #   try:
         optimizer.load_state_dict(checkpoint_dict["optimizer"])

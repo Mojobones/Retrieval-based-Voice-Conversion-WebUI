@@ -10,6 +10,7 @@ n_p = int(sys.argv[3])
 exp_dir = sys.argv[4]
 noparallel = sys.argv[5] == "True"
 per = float(sys.argv[6])
+manifest_path = sys.argv[7] if len(sys.argv) > 7 else ""
 import traceback
 
 import librosa
@@ -21,6 +22,7 @@ from infer.audio import load_audio
 from train.dataset.slicer2 import Slicer
 from i18n.i18n import I18nAuto
 from tools.progress import should_report
+from tools.multispeaker import ManifestError, load_manifest
 
 i18n = I18nAuto()
 
@@ -57,19 +59,19 @@ class PreProcess:
         os.makedirs(self.gt_wavs_dir, exist_ok=True)
         os.makedirs(self.wavs16k_dir, exist_ok=True)
 
-    def norm_write(self, tmp_audio, idx0, idx1):
+    def norm_write(self, tmp_audio, output_key, idx1):
         tmp_max = np.abs(tmp_audio).max()
         if not np.isfinite(tmp_max) or tmp_max <= 0 or tmp_max > 2.5:
             println(
                 i18n("[数据切分][跳过] 无效或异常音频片段：%s_%s | 峰值：%s")
-                % (idx0, idx1, tmp_max)
+                % (output_key, idx1, tmp_max)
             )
             return False
         tmp_audio = (tmp_audio / tmp_max * (self.max * self.alpha)) + (
             1 - self.alpha
         ) * tmp_audio
         wavfile.write(
-            "%s/%s_%s.wav" % (self.gt_wavs_dir, idx0, idx1),
+            "%s/%s_%s.wav" % (self.gt_wavs_dir, output_key, idx1),
             self.sr,
             tmp_audio.astype(np.float32),
         )
@@ -77,13 +79,13 @@ class PreProcess:
             tmp_audio, orig_sr=self.sr, target_sr=16000
         ).astype(np.float32)
         wavfile.write(
-            "%s/%s_%s.wav" % (self.wavs16k_dir, idx0, idx1),
+            "%s/%s_%s.wav" % (self.wavs16k_dir, output_key, idx1),
             16000,
             audio_16k,
         )
         return True
 
-    def pipeline(self, path, idx0, total):
+    def pipeline(self, path, output_key, progress_index, total):
         try:
             audio = load_audio(path, self.sr)
             # zero phased digital filter cause pre-ringing noise...
@@ -98,17 +100,17 @@ class PreProcess:
                     i += 1
                     if len(audio[start:]) > self.tail * self.sr:
                         tmp_audio = audio[start : start + int(self.per * self.sr)]
-                        self.norm_write(tmp_audio, idx0, idx1)
+                        self.norm_write(tmp_audio, output_key, idx1)
                         idx1 += 1
                     else:
                         tmp_audio = audio[start:]
                         idx1 += 1
                         break
-                self.norm_write(tmp_audio, idx0, idx1)
-            if should_report(idx0, total):
+            self.norm_write(tmp_audio, output_key, idx1)
+            if should_report(progress_index, total):
                 println(
                     i18n("[数据切分] 进度：%s/%s | %s")
-                    % (idx0 + 1, total, os.path.basename(path))
+                    % (progress_index + 1, total, os.path.basename(path))
                 )
             return True
         except Exception:
@@ -121,8 +123,8 @@ class PreProcess:
     def pipeline_mp(self, infos):
         success = 0
         failed = 0
-        for path, idx0, total in infos:
-            if self.pipeline(path, idx0, total):
+        for path, output_key, progress_index, total in infos:
+            if self.pipeline(path, output_key, progress_index, total):
                 success += 1
             else:
                 failed += 1
@@ -134,10 +136,13 @@ class PreProcess:
 
     def pipeline_mp_inp_dir(self, inp_root, n_p):
         try:
-            names = sorted(os.listdir(inp_root))
+            names = sorted(
+                name for name in os.listdir(inp_root)
+                if os.path.isfile(os.path.join(inp_root, name))
+            )
             total = len(names)
             infos = [
-                ("%s/%s" % (inp_root, name), idx, total)
+                ("%s/%s" % (inp_root, name), str(idx), idx, total)
                 for idx, name in enumerate(names)
             ]
             worker_count = max(n_p, 1)
@@ -162,11 +167,59 @@ class PreProcess:
         except Exception:
             println(i18n("[数据切分][失败] %s") % traceback.format_exc())
 
+    def pipeline_mp_manifest(self, manifest_entries, n_p):
+        infos = [
+            (entry["path"], entry["output_key"], idx, len(manifest_entries))
+            for idx, entry in enumerate(manifest_entries)
+        ]
+        total = len(infos)
+        worker_count = max(n_p, 1)
+        worker_count = min(worker_count, max(total, 1))
+        println(
+            i18n("[数据切分] 多说话人待处理：%s | 进程数：%s")
+            % (total, worker_count)
+        )
+        if noparallel:
+            for i in range(worker_count):
+                self.pipeline_mp(infos[i::worker_count])
+            return
+        ps = []
+        for i in range(worker_count):
+            p = multiprocessing.Process(
+                target=self.pipeline_mp, args=(infos[i::worker_count],)
+            )
+            ps.append(p)
+            p.start()
+        for p in ps:
+            p.join()
+
 
 def preprocess_trainset(inp_root, sr, n_p, exp_dir, per):
     pp = PreProcess(sr, exp_dir, per)
     println(i18n("[数据切分] 开始"))
-    pp.pipeline_mp_inp_dir(inp_root, n_p)
+    if manifest_path:
+        try:
+            manifest = load_manifest(exp_dir)
+            for output_dir in (pp.gt_wavs_dir, pp.wavs16k_dir):
+                for name in os.listdir(output_dir):
+                    if name.startswith("ms") and name.endswith(".wav"):
+                        try:
+                            os.remove(os.path.join(output_dir, name))
+                        except OSError:
+                            pass
+            pp.pipeline_mp_manifest(manifest["entries"], n_p)
+        except ManifestError as error:
+            println(i18n(error.key) % error.values)
+            raise
+    else:
+        for output_dir in (pp.gt_wavs_dir, pp.wavs16k_dir):
+            for name in os.listdir(output_dir):
+                if name.startswith("ms") and name.endswith(".wav"):
+                    try:
+                        os.remove(os.path.join(output_dir, name))
+                    except OSError:
+                        pass
+        pp.pipeline_mp_inp_dir(inp_root, n_p)
     println(i18n("[数据切分] 完成"))
 
 
