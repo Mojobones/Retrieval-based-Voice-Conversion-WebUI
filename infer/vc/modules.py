@@ -32,6 +32,58 @@ def inference_status(title, state, detail=""):
     return "\n".join(lines)
 
 
+def normalized_speaker_info(checkpoint, n_spk):
+    speaker_info = []
+    seen = set()
+    for item in checkpoint.get("speaker_info", []):
+        try:
+            speaker_id = int(item["id"])
+            speaker_name = str(item["name"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            speaker_id < 0
+            or speaker_id >= n_spk
+            or not speaker_name
+            or speaker_id in seen
+        ):
+            continue
+        seen.add(speaker_id)
+        speaker_info.append({"id": speaker_id, "name": speaker_name})
+    speaker_info.sort(key=lambda item: item["id"])
+    return speaker_info
+
+
+def speaker_selector_updates(checkpoint, n_spk):
+    speaker_info = normalized_speaker_info(checkpoint, n_spk)
+    if speaker_info:
+        choices = [
+            i18n("说话人：%s（ID：%s）") % (item["name"], item["id"])
+            for item in speaker_info
+        ]
+        return (
+            {
+                "visible": False,
+                "value": speaker_info[0]["id"],
+                "__type__": "update",
+            },
+            {
+                "visible": True,
+                "choices": choices,
+                "value": choices[0],
+                "__type__": "update",
+            },
+        )
+    return (
+        {
+            "visible": True,
+            "maximum": max(n_spk - 1, 0),
+            "__type__": "update",
+        },
+        {"visible": False, "value": None, "__type__": "update"},
+    )
+
+
 class VC:
     def __init__(self, config):
         self.n_spk = None
@@ -99,6 +151,7 @@ class VC:
                     torch.cuda.empty_cache()
             return (
                 {"visible": False, "__type__": "update"},
+                {"visible": False, "value": None, "__type__": "update"},
                 {
                     "visible": True,
                     "value": to_return_protect0,
@@ -146,19 +199,28 @@ class VC:
 
         self.pipeline = Pipeline(self.tgt_sr, self.config)
         n_spk = self.cpt["config"][-3]
-        index = {"value": get_index_path_from_model(sid), "__type__": "update"}
+        speaker_info = normalized_speaker_info(self.cpt, n_spk)
+        speaker_slider_update, speaker_dropdown_update = speaker_selector_updates(
+            self.cpt, n_spk
+        )
+        default_speaker_id = speaker_info[0]["id"] if speaker_info else 0
+        index = {
+            "value": get_index_path_from_model(sid, default_speaker_id),
+            "__type__": "update",
+        }
         logger.info("%s: %s", i18n("选择索引"), index["value"])
 
         return (
             (
-                {"visible": True, "maximum": n_spk, "__type__": "update"},
+                speaker_slider_update,
+                speaker_dropdown_update,
                 to_return_protect0,
                 to_return_protect1,
                 index,
                 index,
             )
             if to_return_protect
-            else {"visible": True, "maximum": n_spk, "__type__": "update"}
+            else speaker_slider_update
         )
 
     def vc_single(

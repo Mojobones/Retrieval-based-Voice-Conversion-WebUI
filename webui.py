@@ -1,6 +1,15 @@
 import os
 import shutil
 import html
+import copy
+import re
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
 
 # Offline WebUI keeps the CUDA Graph implementation available, but remains
 # eager by default. Set RVC_OFFLINE_CUDA_GRAPH=1 to opt in for benchmarking or
@@ -34,6 +43,7 @@ for name in os.listdir(tmp):
 
 from configs.config import Config, GPU_INDEX, GPU_INFOS, GPU_MEMORY, IS_GPU
 from infer.vc.modules import VC
+from infer.vc.utils import get_index_path_from_model
 from tools.pymss_webui import (
     PYMSS_MODEL_CHOICES,
     get_model_info,
@@ -42,6 +52,13 @@ from tools.pymss_webui import (
 )
 from tools.file_io import read_text
 from tools.process_utils import kill_process_tree
+from tools.multispeaker import (
+    ManifestError,
+    build_manifest_from_root,
+    build_manifest_from_rows,
+    load_manifest,
+    write_manifest,
+)
 from train.process_ckpt import (
     change_info,
     extract_small_model,
@@ -57,7 +74,6 @@ import json
 from time import sleep
 from subprocess import Popen
 from random import shuffle
-import warnings
 import traceback
 import threading
 import logging
@@ -166,6 +182,8 @@ else:
     gpu_info = i18n("很遗憾您这没有能用的显卡来支持您训练")
     default_batch_size = 1
 gpus = "-".join(str(i) for i in gpu_indices)
+feature_gpus = "%s-%s" % (gpus, gpus) if gpus else ""
+default_training_f0_method = "rmvpe" if IS_GPU else "pm"
 
 
 class ToolButton(gr.Button, gr.components.FormComponent):
@@ -207,11 +225,254 @@ def clean():
     return {"value": "", "__type__": "update"}
 
 
+def selected_speaker_id(slider_value, dropdown_value):
+    value = dropdown_value if dropdown_value is not None else slider_value
+    if isinstance(value, str):
+        match = re.search(r"ID\s*[:：]\s*(\d+)\s*[)）]?\s*$", value)
+        if match:
+            return int(match.group(1))
+    return int(value)
+
+
+def normalize_index_path(file_index):
+    return (
+        str(file_index or "")
+        .strip(" ")
+        .strip('"')
+        .strip("\n")
+        .strip('"')
+        .strip(" ")
+        .replace("trained", "added")
+    )
+
+
+def report_missing_index(file_index):
+    index_path = normalize_index_path(file_index)
+    if index_path and not os.path.isfile(index_path):
+        message = i18n("索引文件不存在，将不使用索引继续推理：%s") % index_path
+        print(message, flush=True)
+        raise gr.Error(message)
+
+
+def update_speaker_index(model_name, slider_value, dropdown_value):
+    try:
+        speaker_id = selected_speaker_id(slider_value, dropdown_value)
+    except (TypeError, ValueError):
+        speaker_id = None
+    path = get_index_path_from_model(model_name, speaker_id)
+    update = {"value": path, "__type__": "update"}
+    return update, dict(update)
+
+
+def update_dropdown_speaker_index(model_name, dropdown_value):
+    return update_speaker_index(model_name, 0, dropdown_value)
+
+
+def vc_single_with_speaker(slider_value, dropdown_value, *args):
+    return vc.vc_single(selected_speaker_id(slider_value, dropdown_value), *args)
+
+
+def vc_multi_with_speaker(slider_value, dropdown_value, *args):
+    yield from vc.vc_multi(selected_speaker_id(slider_value, dropdown_value), *args)
+
+
 sr_dict = {
     "32k": 32000,
     "40k": 40000,
     "48k": 48000,
 }
+
+MULTISPEAKER_PAGE_SIZE = 10
+MULTISPEAKER_MAX_ROWS = 110
+
+
+def is_multispeaker_mode(training_mode):
+    return training_mode in ("多说话人", i18n("多说话人"))
+
+
+def manifest_error_text(error):
+    text = i18n(error.key)
+    return text % error.values if error.values else text
+
+
+def experiment_path(exp_name):
+    return os.path.join(now_dir, "logs", str(exp_name or "").strip())
+
+
+def prepare_multispeaker_manifest(trainset_dir, exp_name):
+    exp_path = experiment_path(exp_name)
+    try:
+        if str(trainset_dir or "").strip():
+            manifest = build_manifest_from_root(trainset_dir)
+            write_manifest(exp_path, manifest)
+            return manifest
+        return load_manifest(exp_path)
+    except ManifestError as error:
+        raise RuntimeError(manifest_error_text(error))
+
+
+def load_experiment_manifest(exp_path):
+    try:
+        return load_manifest(exp_path)
+    except ManifestError as error:
+        raise RuntimeError(manifest_error_text(error))
+
+
+def change_training_mode(training_mode):
+    multi = is_multispeaker_mode(training_mode)
+    label = (
+        i18n("多说话人训练集总文件夹路径")
+        if multi
+        else i18n("输入训练文件夹路径")
+    )
+    placeholder = i18n("留空则使用辅助页已提交的清单") if multi else ""
+    textbox_update = gr.Textbox.update(label=label, placeholder=placeholder)
+    if multi:
+        textbox_update["value"] = ""
+    return textbox_update, gr.Slider.update(visible=not multi)
+
+
+def sync_exp_name(source_value, target_value):
+    if str(source_value or "") == str(target_value or ""):
+        return gr.Textbox.update()
+    return gr.Textbox.update(value=source_value)
+
+
+def empty_multispeaker_rows():
+    rows = [["", "", "", ""] for _ in range(MULTISPEAKER_MAX_ROWS)]
+    rows[0] = ["", "", 0, 1]
+    rows[1] = ["", "", 1, 1]
+    return rows
+
+
+def sync_multispeaker_page(rows, active_count, page, values):
+    rows = [list(row) for row in (rows or empty_multispeaker_rows())]
+    while len(rows) < MULTISPEAKER_MAX_ROWS:
+        rows.append(["", "", "", ""])
+    start = int(page) * MULTISPEAKER_PAGE_SIZE
+    for slot in range(MULTISPEAKER_PAGE_SIZE):
+        index = start + slot
+        if index >= MULTISPEAKER_MAX_ROWS:
+            break
+        offset = slot * 4
+        rows[index] = [
+            values[offset],
+            values[offset + 1],
+            values[offset + 2],
+            values[offset + 3],
+        ]
+    return rows
+
+
+def multispeaker_page_updates(rows, active_count, page):
+    active_count = max(2, min(MULTISPEAKER_MAX_ROWS, int(active_count)))
+    total_pages = max(1, (active_count + MULTISPEAKER_PAGE_SIZE - 1) // MULTISPEAKER_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * MULTISPEAKER_PAGE_SIZE
+    updates = []
+    for slot in range(MULTISPEAKER_PAGE_SIZE):
+        index = start + slot
+        visible = index < active_count
+        row = rows[index] if index < len(rows) else ["", "", "", ""]
+        updates.extend(
+            [
+                gr.Textbox.update(value=row[0], visible=visible),
+                gr.Textbox.update(value=row[1], visible=visible),
+                gr.Number.update(
+                    value=row[2] if row[2] not in ("", None) else None,
+                    visible=visible,
+                ),
+                gr.Number.update(
+                    value=row[3] if row[3] not in ("", None) else None,
+                    visible=visible,
+                ),
+            ]
+        )
+    page_text = i18n("第%s/%s页，共%s行") % (page + 1, total_pages, active_count)
+    return tuple([rows, active_count, page, page_text] + updates)
+
+
+def change_multispeaker_page(action, rows, active_count, page, *values):
+    rows = sync_multispeaker_page(rows, active_count, page, values)
+    active_count = int(active_count)
+    page = int(page)
+    if action == "add":
+        if active_count < MULTISPEAKER_MAX_ROWS:
+            used_ids = set()
+            for row in rows[:active_count]:
+                try:
+                    speaker_id = int(float(row[2]))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= speaker_id <= 109:
+                    used_ids.add(speaker_id)
+            speaker_id = next(
+                value for value in range(110) if value not in used_ids
+            )
+            rows[active_count] = ["", "", speaker_id, 1]
+            active_count += 1
+        page = (active_count - 1) // MULTISPEAKER_PAGE_SIZE
+    elif action == "remove":
+        if active_count > 2:
+            active_count -= 1
+            rows[active_count] = ["", "", "", ""]
+        page = min(page, (active_count - 1) // MULTISPEAKER_PAGE_SIZE)
+    elif action == "previous":
+        page -= 1
+    elif action == "next":
+        page += 1
+    return multispeaker_page_updates(rows, active_count, page)
+
+
+def add_multispeaker_row(rows, active_count, page, *values):
+    return change_multispeaker_page("add", rows, active_count, page, *values)
+
+
+def remove_multispeaker_row(rows, active_count, page, *values):
+    return change_multispeaker_page("remove", rows, active_count, page, *values)
+
+
+def previous_multispeaker_page(rows, active_count, page, *values):
+    return change_multispeaker_page("previous", rows, active_count, page, *values)
+
+
+def next_multispeaker_page(rows, active_count, page, *values):
+    return change_multispeaker_page("next", rows, active_count, page, *values)
+
+
+def render_multispeaker_submit_status(message, warning=False):
+    color = "#9a6700" if warning else "#116329"
+    background = "#fff8c5" if warning else "#dafbe1"
+    return (
+        '<div class="multispeaker-submit-status" style="border-color:%s;'
+        'background:%s;color:%s;">%s</div>'
+    ) % (color, background, color, html.escape(message))
+
+
+def submit_multispeaker_rows(exp_name, rows, active_count, page, *values):
+    rows = sync_multispeaker_page(rows, active_count, page, values)
+    exp_name = str(exp_name or "").strip()
+    if not exp_name:
+        raise gr.Error(i18n("实验名不能为空"))
+    try:
+        manifest, invalid_rows = build_manifest_from_rows(rows[: int(active_count)])
+        path = write_manifest(experiment_path(exp_name), manifest)
+    except ManifestError as error:
+        raise gr.Error(manifest_error_text(error))
+    message = i18n("多说话人训练集清单已保存：%s；有效音频%s个") % (
+        path,
+        len(manifest["entries"]),
+    )
+    if invalid_rows:
+        warning_text = i18n("以下行填写不完整或无效，已忽略：%s") % ", ".join(
+            str(index) for index in invalid_rows
+        )
+        if hasattr(gr, "Warning"):
+            gr.Warning(warning_text)
+        logger.warning(warning_text)
+        message = "%s\n%s" % (warning_text, message)
+        return rows, render_multispeaker_submit_status(message, True)
+    return rows, render_multispeaker_submit_status(message)
 
 
 TRAIN_TASK_LOCK = threading.Lock()
@@ -588,13 +849,22 @@ def wait_train_processes(
             raise RuntimeError(i18n("子进程执行失败，返回码：%s") % failed)
 
 
-def run_preprocess_dataset(trainset_dir, exp_dir, sr, n_p, state, format_output=True):
+def run_preprocess_dataset(
+    trainset_dir, exp_dir, sr, n_p, state, format_output=True, training_mode=None
+):
     sr = sr_dict[sr]
     os.makedirs("%s/logs/%s" % (now_dir, exp_dir), exist_ok=True)
+    if is_multispeaker_mode(training_mode):
+        prepare_multispeaker_manifest(trainset_dir, exp_dir)
     log_path = "%s/logs/%s/preprocess.log" % (now_dir, exp_dir)
     with open(log_path, "w", encoding="utf8"):
         pass
-    cmd = '"%s" train/preprocess.py "%s" %s %s "%s/logs/%s" %s %.1f' % (
+    manifest_arg = (
+        ' "%s/logs/%s/multispeaker_manifest.json"' % (now_dir, exp_dir)
+        if is_multispeaker_mode(training_mode)
+        else ""
+    )
+    cmd = '"%s" train/preprocess.py "%s" %s %s "%s/logs/%s" %s %.1f%s' % (
         config.python_cmd,
         trainset_dir,
         sr,
@@ -603,6 +873,7 @@ def run_preprocess_dataset(trainset_dir, exp_dir, sr, n_p, state, format_output=
         exp_dir,
         config.noparallel,
         config.preprocess_per,
+        manifest_arg,
     )
     extract_start_time = time.time()
     requested_workers = max(int(n_p), 1)
@@ -630,7 +901,7 @@ def run_preprocess_dataset(trainset_dir, exp_dir, sr, n_p, state, format_output=
         validate_preprocess_outputs(exp_dir)
 
 
-def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
+def preprocess_dataset(trainset_dir, exp_dir, sr, n_p, training_mode=None):
     action, state = begin_train_task("数据切分")
     if action == "busy":
         yield (
@@ -650,7 +921,9 @@ def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
             button_update(visible=False),
             button_update(visible=True),
         )
-        for info in run_preprocess_dataset(trainset_dir, exp_dir, sr, n_p, state):
+        for info in run_preprocess_dataset(
+            trainset_dir, exp_dir, sr, n_p, state, training_mode=training_mode
+        ):
             yield info, button_update(visible=False), button_update(visible=True)
         if train_task_stopped(state):
             final_info = format_status("数据切分", "已停止")
@@ -868,7 +1141,7 @@ def change_f0(if_f0_3, sr2, version19):  # f0method8,pretrained_G14,pretrained_D
     path_str = "" if version19 == "v1" else "_v2"
     return (
         {"visible": if_f0_3, "__type__": "update"},
-        {"visible": if_f0_3, "__type__": "update"},
+        {"visible": bool(if_f0_3) and F0GPUVisible, "__type__": "update"},
         *get_pretrained_models(path_str, "f0" if if_f0_3 == True else "", sr2),
     )
 
@@ -891,6 +1164,7 @@ def run_train_model(
     version19,
     state,
     format_output=True,
+    training_mode=None,
 ):
     # 生成filelist
     exp_dir = "%s/logs/%s" % (now_dir, exp_dir1)
@@ -914,12 +1188,31 @@ def run_train_model(
         names = set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)]) & set(
             [name.split(".")[0] for name in os.listdir(feature_dir)]
         )
+    multi = is_multispeaker_mode(training_mode)
+    manifest = load_experiment_manifest(exp_dir) if multi else None
+    manifest_by_key = (
+        {entry["output_key"]: entry for entry in manifest["entries"]}
+        if manifest
+        else {}
+    )
+    if multi:
+        names = {
+            name for name in names
+            if name.rsplit("_", 1)[0] in manifest_by_key
+        }
     if not names:
         raise RuntimeError(i18n("没有可用于训练的有效音频，请先完成数据切分和特征提取"))
     opt = []
-    for name in names:
+    active_speaker_names = {}
+    for name in sorted(names):
+        entry = manifest_by_key.get(name.rsplit("_", 1)[0]) if multi else None
+        speaker_id = entry["speaker_id"] if entry else int(spk_id5)
+        if multi:
+            speaker_name = entry["speaker_name"]
+            active_speaker_names[speaker_id] = speaker_name
+        repeat = entry["repeat"] if entry else 1
         if if_f0_3:
-            opt.append(
+            line = (
                 "%s/%s.wav|%s/%s.npy|%s/%s.wav.npy|%s/%s.wav.npy|%s"
                 % (
                     gt_wavs_dir.replace("\\", "\\\\"),
@@ -930,33 +1223,51 @@ def run_train_model(
                     name,
                     f0nsf_dir.replace("\\", "\\\\"),
                     name,
-                    spk_id5,
+                    speaker_id,
                 )
             )
         else:
-            opt.append(
+            line = (
                 "%s/%s.wav|%s/%s.npy|%s"
                 % (
                     gt_wavs_dir.replace("\\", "\\\\"),
                     name,
                     feature_dir.replace("\\", "\\\\"),
                     name,
-                    spk_id5,
+                    speaker_id,
                 )
             )
+        if multi:
+            line = "%s|%s" % (line, speaker_name)
+        opt.extend([line] * repeat)
     fea_dim = 256 if version19 == "v1" else 768
+    mute_speaker_ids = (
+        sorted(active_speaker_names)
+        if multi
+        else [int(spk_id5)]
+    )
     if if_f0_3:
-        for _ in range(2):
-            opt.append(
-                "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s/logs/mute/2a_f0/mute.wav.npy|%s/logs/mute/2b-f0nsf/mute.wav.npy|%s"
-                % (now_dir, sr2, now_dir, fea_dim, now_dir, now_dir, spk_id5)
-            )
+        for speaker_id in mute_speaker_ids:
+            for _ in range(2):
+                line = (
+                    "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s/logs/mute/2a_f0/mute.wav.npy|%s/logs/mute/2b-f0nsf/mute.wav.npy|%s|%s"
+                    % (now_dir, sr2, now_dir, fea_dim, now_dir, now_dir, speaker_id, active_speaker_names[speaker_id])
+                    if multi
+                    else "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s/logs/mute/2a_f0/mute.wav.npy|%s/logs/mute/2b-f0nsf/mute.wav.npy|%s"
+                    % (now_dir, sr2, now_dir, fea_dim, now_dir, now_dir, speaker_id)
+                )
+                opt.append(line)
     else:
-        for _ in range(2):
-            opt.append(
-                "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s"
-                % (now_dir, sr2, now_dir, fea_dim, spk_id5)
-            )
+        for speaker_id in mute_speaker_ids:
+            for _ in range(2):
+                line = (
+                    "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s|%s"
+                    % (now_dir, sr2, now_dir, fea_dim, speaker_id, active_speaker_names[speaker_id])
+                    if multi
+                    else "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|%s"
+                    % (now_dir, sr2, now_dir, fea_dim, speaker_id)
+                )
+                opt.append(line)
     shuffle(opt)
     with open("%s/filelist.txt" % exp_dir, "w", encoding="utf8") as f:
         f.write("\n".join(opt))
@@ -973,16 +1284,27 @@ def run_train_model(
     else:
         config_path = "v2/%s.json" % sr2
     config_save_path = os.path.join(exp_dir, "config.json")
-    if not pathlib.Path(config_save_path).exists():
-        with open(config_save_path, "w", encoding="utf8") as f:
-            json.dump(
-                config.json_config[config_path],
-                f,
-                ensure_ascii=False,
-                indent=4,
-                sort_keys=True,
-            )
-            f.write("\n")
+    if pathlib.Path(config_save_path).exists():
+        config_data = json.loads(read_text(config_save_path))
+    else:
+        config_data = copy.deepcopy(config.json_config[config_path])
+    if multi:
+        config_data["model"]["spk_embed_dim"] = 110
+        config_data["speaker_info"] = [
+            {"id": speaker_id, "name": active_speaker_names[speaker_id]}
+            for speaker_id in sorted(active_speaker_names)
+        ]
+    else:
+        config_data.pop("speaker_info", None)
+    with open(config_save_path, "w", encoding="utf8") as f:
+        json.dump(
+            config_data,
+            f,
+            ensure_ascii=False,
+            indent=4,
+            sort_keys=True,
+        )
+        f.write("\n")
     if gpus16:
         cmd = (
             '"%s" train/train.py -e "%s" -sr %s -f0 %s -bs %s -g %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
@@ -1049,6 +1371,7 @@ def click_train(
     if_cache_gpu17,
     if_save_every_weights18,
     version19,
+    training_mode=None,
 ):
     known_models = tuple(weight_names())
     action, state = begin_train_task("模型训练")
@@ -1088,6 +1411,7 @@ def click_train(
             if_save_every_weights18,
             version19,
             state,
+            training_mode=training_mode,
         ):
             known_models, model_update = refresh_weight_choices(known_models)
             yield (
@@ -1118,20 +1442,30 @@ def stop_train_model():
 
 
 # but4.click(train_index, [exp_dir1], info3)
-def run_train_index(exp_dir1, version19, state, format_output=True):
+def run_train_index(
+    exp_dir1, version19, state, format_output=True, training_mode=None
+):
     exp_dir = os.path.join(now_dir, "logs", exp_dir1)
     os.makedirs(exp_dir, exist_ok=True)
     log_path = os.path.join(exp_dir, "train_index.log")
     with open(log_path, "w", encoding="utf8"):
         pass
+    index_mode = (
+        "multi"
+        if is_multispeaker_mode(training_mode)
+        else "single"
+        if training_mode
+        else "auto"
+    )
     cmd = (
-        '"%s" train/train_index.py "%s" %s "%s" %s'
+        '"%s" train/train_index.py "%s" %s "%s" %s %s'
         % (
             config.python_cmd,
             exp_dir1,
             version19,
             outside_index_root,
             config.n_cpu,
+            index_mode,
         )
     )
     process = start_train_process(state, cmd)
@@ -1140,7 +1474,7 @@ def run_train_index(exp_dir1, version19, state, format_output=True):
     )
 
 
-def train_index(exp_dir1, version19):
+def train_index(exp_dir1, version19, training_mode=None):
     action, state = begin_train_task("索引训练")
     if action == "busy":
         yield (
@@ -1160,7 +1494,7 @@ def train_index(exp_dir1, version19):
             button_update(visible=False),
             button_update(visible=True),
         )
-        for info in run_train_index(exp_dir1, version19, state):
+        for info in run_train_index(exp_dir1, version19, state, True, training_mode):
             yield info, button_update(visible=False), button_update(visible=True)
         if train_task_stopped(state):
             final_info = format_status("索引训练", "已停止")
@@ -1196,6 +1530,7 @@ def train1key(
     if_save_every_weights18,
     version19,
     gpus_rmvpe,
+    training_mode=None,
 ):
     known_models = tuple(weight_names())
     action, state = begin_train_task("一键训练")
@@ -1234,7 +1569,13 @@ def train1key(
             button_update(),
         )
         for info in run_preprocess_dataset(
-            trainset_dir4, exp_dir1, sr2, np7, state, False
+            trainset_dir4,
+            exp_dir1,
+            sr2,
+            np7,
+            state,
+            False,
+            training_mode,
         ):
             yield (
                 format_workflow_status(step, info, completed_steps),
@@ -1300,6 +1641,7 @@ def train1key(
                 version19,
                 state,
                 False,
+                training_mode,
             ):
                 known_models, model_update = refresh_weight_choices(known_models)
                 yield (
@@ -1327,7 +1669,9 @@ def train1key(
                 stop_button,
                 button_update(),
             )
-            for info in run_train_index(exp_dir1, version19, state, False):
+            for info in run_train_index(
+                exp_dir1, version19, state, False, training_mode
+            ):
                 yield (
                     format_workflow_status(step, info, completed_steps),
                     start_button,
@@ -1391,7 +1735,6 @@ def change_info_(ckpt_path):
 F0GPUVisible = IS_GPU
 
 TRAINING_INFO_CSS = """
-#training-info-step2a textarea,
 #training-info-step2b textarea,
 #training-info-step3 textarea {
     height: 12rem !important;
@@ -1399,6 +1742,78 @@ TRAINING_INFO_CSS = """
     max-height: 12rem !important;
     overflow-y: auto !important;
     resize: none !important;
+}
+#training-info-step2a textarea {
+    height: 8rem !important;
+    min-height: 8rem !important;
+    max-height: 8rem !important;
+    overflow-y: auto !important;
+    resize: none !important;
+}
+.multispeaker-help {
+    position: relative;
+    display: inline-block;
+    margin: 8px 0 0 6px;
+    color: #2563eb;
+    cursor: help;
+    font-weight: 700;
+    z-index: 10001;
+}
+.multispeaker-help > .multispeaker-help-popup {
+    position: absolute;
+    left: 18px;
+    top: -8px;
+    width: min(480px, calc(100vw - 80px));
+    padding: 14px 16px;
+    border: 1px solid #93c5fd;
+    border-radius: 6px;
+    background: #eff6ff;
+    color: #1e3a8a;
+    box-shadow: 0 10px 28px rgba(15, 23, 42, .18);
+    line-height: 1.55;
+    font-size: 13px;
+    font-weight: 400;
+    z-index: 10002;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-4px);
+    transition: opacity .16s ease, transform .16s ease;
+}
+.multispeaker-help-warning {
+    margin-bottom: 8px;
+    color: #b91c1c;
+    font-weight: 700;
+}
+.multispeaker-help:hover > .multispeaker-help-popup,
+.multispeaker-help:focus-within > .multispeaker-help-popup {
+    opacity: 1;
+    transform: translateY(0);
+}
+#training-mode-column {
+    flex: 0 0 270px !important;
+    min-width: 270px !important;
+    max-width: 270px !important;
+}
+#training-mode-selector .wrap {
+    flex-wrap: nowrap !important;
+}
+#multispeaker-help-column {
+    position: relative !important;
+    z-index: 10000 !important;
+    flex: 0 0 44px !important;
+    min-width: 44px !important;
+    max-width: 44px !important;
+    overflow: visible !important;
+}
+#multispeaker-help-column > div {
+    overflow: visible !important;
+}
+.multispeaker-submit-status {
+    padding: 10px 12px;
+    border: 1px solid;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    line-height: 1.45;
 }
 """
 
@@ -1433,6 +1848,13 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                     step=1,
                     label=i18n("请选择说话人id"),
                     value=0,
+                    visible=False,
+                    interactive=True,
+                )
+                spk_item_dropdown = gr.Dropdown(
+                    label=i18n("选择多说话人音色"),
+                    choices=[],
+                    value=None,
                     visible=False,
                     interactive=True,
                 )
@@ -1519,9 +1941,17 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                             )
 
                         but0.click(
-                            vc.vc_single,
+                            report_missing_index,
+                            [file_index1],
+                            [],
+                            queue=False,
+                            api_name="infer_check_index",
+                        )
+                        but0.click(
+                            vc_single_with_speaker,
                             [
                                 spk_item,
+                                spk_item_dropdown,
                                 input_audio0,
                                 vc_transform0,
                                 f0method0,
@@ -1619,9 +2049,17 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                     vc_output3 = gr.Textbox(label=i18n("输出信息"))
 
                     but1.click(
-                        vc.vc_multi,
+                        report_missing_index,
+                        [file_index3],
+                        [],
+                        queue=False,
+                        api_name="infer_check_index_batch",
+                    )
+                    but1.click(
+                        vc_multi_with_speaker,
                         [
                             spk_item,
+                            spk_item_dropdown,
                             dir_input,
                             opt_input,
                             inputs,
@@ -1640,8 +2078,29 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                 sid0.change(
                     fn=vc.get_vc,
                     inputs=[sid0, protect0, protect1],
-                    outputs=[spk_item, protect0, protect1, file_index1, file_index3],
+                    outputs=[
+                        spk_item,
+                        spk_item_dropdown,
+                        protect0,
+                        protect1,
+                        file_index1,
+                        file_index3,
+                    ],
                     api_name="infer_change_voice",
+                )
+                spk_item.change(
+                    fn=update_speaker_index,
+                    inputs=[sid0, spk_item, spk_item_dropdown],
+                    outputs=[file_index1, file_index3],
+                    queue=False,
+                    api_name="infer_change_speaker_index_slider",
+                )
+                spk_item_dropdown.change(
+                    fn=update_dropdown_speaker_index,
+                    inputs=[sid0, spk_item_dropdown],
+                    outputs=[file_index1, file_index3],
+                    queue=False,
+                    api_name="infer_change_speaker_index_dropdown",
                 )
         with gr.TabItem(i18n("人声伴奏分离&去混响")):
             with gr.Group():
@@ -1725,7 +2184,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                 )
             )
             with gr.Row():
-                exp_dir1 = gr.Textbox(label=i18n("输入实验名"), value="mi-test")
+                exp_dir1 = gr.Textbox(label=i18n("输入实验名，例如：test"))
                 sr2 = gr.Radio(
                     label=i18n("目标采样率"),
                     choices=["40k", "48k"],
@@ -1753,94 +2212,152 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                     value=int(np.ceil(config.n_cpu / 1.5)),
                     interactive=True,
                 )
-            with gr.Group():  # 暂时单人的, 后面支持最多4人的#数据处理
-                gr.Markdown(
-                    value=i18n(
-                        "step2a: 自动遍历训练文件夹下所有可解码成音频的文件并进行切片归一化, 在实验目录下生成2个wav文件夹; 暂时只支持单人训练. "
-                    )
-                )
-                with gr.Row():
-                    trainset_dir4 = gr.Textbox(
-                        label=i18n("输入训练文件夹路径"),
-                        value=i18n("E:\\语音音频+标注\\米津玄师\\src"),
-                    )
-                    spk_id5 = gr.Slider(
-                        minimum=0,
-                        maximum=4,
-                        step=1,
-                        label=i18n("请指定说话人id"),
-                        value=0,
-                        interactive=True,
-                    )
-                    but1 = gr.Button(i18n("处理数据"), variant="primary")
-                    stop_but1 = gr.Button(
-                        i18n("停止处理数据"), variant="stop", visible=False
-                    )
-                    info1 = gr.Textbox(
-                        label=i18n("输出信息"),
-                        value="",
-                        lines=8,
-                        max_lines=8,
-                        elem_id="training-info-step2a",
-                    )
-                    but1.click(
-                        preprocess_dataset,
-                        [trainset_dir4, exp_dir1, sr2, np7],
-                        [info1, but1, stop_but1],
-                        api_name="train_preprocess",
-                    )
-                    stop_but1.click(
-                        stop_preprocess_dataset,
-                        [],
-                        [info1, but1, stop_but1],
-                        queue=False,
-                    )
             with gr.Group():
                 gr.Markdown(
                     value=i18n(
-                        "step2b: 使用CPU提取音高(如果模型带音高), 使用GPU提取特征(选择卡号)"
+                        "step2a: 扫描训练音频并进行切片归一化，在实验目录下生成训练wav文件。"
                     )
                 )
-                with gr.Row():
-                    with gr.Column():
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=5, min_width=420):
+                        with gr.Row():
+                            with gr.Column(
+                                scale=0,
+                                min_width=270,
+                                elem_id="training-mode-column",
+                            ):
+                                training_mode = gr.Radio(
+                                    label=i18n("训练集类型"),
+                                    choices=[i18n("单说话人"), i18n("多说话人")],
+                                    value=i18n("单说话人"),
+                                    interactive=True,
+                                    elem_id="training-mode-selector",
+                                )
+                            with gr.Column(
+                                scale=0,
+                                min_width=44,
+                                elem_id="multispeaker-help-column",
+                            ):
+                                multispeaker_help = gr.HTML(
+                                    value=(
+                                        '<div class="multispeaker-help" tabindex="0">?'
+                                        '<div class="multispeaker-help-popup">'
+                                        '<div class="multispeaker-help-warning">%s</div>%s'
+                                        "</div></div>"
+                                        % (
+                                            html.escape(
+                                                i18n(
+                                                    "注意：多说话人训练音色还原度不一定有单说话人分开训练好！"
+                                                )
+                                            ),
+                                            html.escape(
+                                                i18n(
+                                                    "多说话人总文件夹只扫描根目录下的直接子文件夹，根目录文件会被忽略。\n子文件夹必须命名为x_y_z：x是说话人名称，y是说话人ID（0~109，共110个），z是训练集重复次数。\n也可以到右侧“多说话人训练集辅助”编辑并提交训练集清单。"
+                                                )
+                                            ).replace("\n", "<br>"),
+                                        )
+                                    )
+                                )
+                        with gr.Row():
+                            trainset_dir4 = gr.Textbox(
+                                label=i18n(
+                                    "输入训练文件夹路径，例如：E:\\我的训练集"
+                                ),
+                            )
+                            spk_id5 = gr.Slider(
+                                minimum=0,
+                                maximum=109,
+                                step=1,
+                                label=i18n("请指定说话人id"),
+                                value=0,
+                                interactive=True,
+                            )
+                    with gr.Column(scale=1, min_width=150):
+                        but1 = gr.Button(i18n("处理数据"), variant="primary")
+                        stop_but1 = gr.Button(
+                            i18n("停止处理数据"), variant="stop", visible=False
+                        )
+                    with gr.Column(
+                        scale=3,
+                        min_width=280,
+                        elem_id="step2a-output-column",
+                    ):
+                        info1 = gr.Textbox(
+                            label=i18n("输出信息"),
+                            value="",
+                            lines=5,
+                            max_lines=5,
+                            elem_id="training-info-step2a",
+                        )
+                but1.click(
+                    preprocess_dataset,
+                    [trainset_dir4, exp_dir1, sr2, np7, training_mode],
+                    [info1, but1, stop_but1],
+                    api_name="train_preprocess",
+                )
+                stop_but1.click(
+                    stop_preprocess_dataset,
+                    [],
+                    [info1, but1, stop_but1],
+                    queue=False,
+                )
+                training_mode.change(
+                    change_training_mode,
+                    [training_mode],
+                    [trainset_dir4, spk_id5],
+                    queue=False,
+                )
+            with gr.Group():
+                gr.Markdown(
+                    value=i18n(
+                        "step2b: 音高与hubert语义特征提取"
+                    )
+                )
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=3, min_width=320):
                         gpus6 = gr.Textbox(
                             label=i18n(
-                                "以-分隔输入使用的卡号, 例如   0-1-2   使用卡0和卡1和卡2"
+                                "hubert:以-分隔输入使用的卡号, 例如 0-1-2 使用卡0和卡1和卡2"
                             ),
-                            value=gpus,
+                            value=feature_gpus,
                             interactive=True,
                             visible=F0GPUVisible,
-                        )
-                        gpu_info9 = gr.Textbox(
-                            label=i18n("显卡信息"), value=gpu_info, visible=F0GPUVisible
-                        )
-                    with gr.Column():
-                        f0method8 = gr.Radio(
-                            label=i18n("选择音高提取算法"),
-                            choices=["pm", "rmvpe"],
-                            value="rmvpe",
-                            interactive=True,
                         )
                         gpus_rmvpe = gr.Textbox(
                             label=i18n(
                                 "rmvpe卡号配置：以-分隔输入使用的不同进程卡号,例如0-0-1使用在卡0上跑2个进程并在卡1上跑1个进程"
                             ),
-                            value="%s-%s" % (gpus, gpus),
+                            value=feature_gpus,
                             interactive=True,
                             visible=F0GPUVisible,
                         )
-                with gr.Row():
-                    but2 = gr.Button(i18n("特征提取"), variant="primary")
-                    stop_but2 = gr.Button(
-                        i18n("停止特征提取"), variant="stop", visible=False
-                    )
-                info2 = gr.Textbox(
-                    label=i18n("输出信息"),
-                    value="",
-                    lines=8,
-                    max_lines=8,
-                    elem_id="training-info-step2b",
-                )
+                    with gr.Column(scale=2, min_width=260):
+                        gpu_info9 = gr.Textbox(
+                            label=i18n("显卡信息"), value=gpu_info, visible=F0GPUVisible
+                        )
+                        f0method8 = gr.Radio(
+                            label=i18n("选择音高提取算法"),
+                            choices=["pm", "rmvpe"],
+                            value=default_training_f0_method,
+                            interactive=True,
+                        )
+                    with gr.Column(scale=1, min_width=150):
+                        but2 = gr.Button(i18n("特征提取"), variant="primary")
+                        stop_but2 = gr.Button(
+                            i18n("停止特征提取"), variant="stop", visible=False
+                        )
+                    with gr.Column(
+                        scale=3,
+                        min_width=280,
+                        elem_id="step2b-output-column",
+                    ):
+                        info2 = gr.Textbox(
+                            label=i18n("输出信息"),
+                            value="",
+                            lines=8,
+                            max_lines=8,
+                            elem_id="training-info-step2b",
+                        )
                 f0method8.change(
                     fn=change_f0_method,
                     inputs=[f0method8],
@@ -1984,6 +2501,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                             if_cache_gpu17,
                             if_save_every_weights18,
                             version19,
+                            training_mode,
                         ],
                         [info3, but3, stop_but3, sid0],
                         api_name="train_start",
@@ -1996,7 +2514,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                     )
                     but4.click(
                         train_index,
-                        [exp_dir1, version19],
+                        [exp_dir1, version19, training_mode],
                         [info3, but4, stop_but4],
                     )
                     stop_but4.click(
@@ -2026,6 +2544,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                             if_save_every_weights18,
                             version19,
                             gpus_rmvpe,
+                            training_mode,
                         ],
                         [info3, but5, stop_but5, sid0],
                         api_name="train_start_all",
@@ -2036,6 +2555,120 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                         [info3, but5, stop_but5],
                         queue=False,
                     )
+
+        with gr.TabItem(i18n("多说话人训练集辅助")):
+            helper_rows_state = gr.State(empty_multispeaker_rows())
+            helper_row_count = gr.State(2)
+            helper_page = gr.State(0)
+            gr.Markdown(
+                value=i18n(
+                    "为多说话人训练集建立清单。空行会被忽略；路径、说话人名称、说话人ID或重复次数填写不全的行会在提交时提示。"
+                )
+            )
+            with gr.Row():
+                helper_exp_name = gr.Textbox(
+                    label=i18n("输入实验名，例如：test")
+                )
+                helper_submit = gr.Button(i18n("提交训练集清单"), variant="primary")
+                helper_previous = gr.Button(i18n("上一页"))
+                helper_page_label = gr.Markdown(
+                    value=i18n("第%s/%s页，共%s行") % (1, 1, 2)
+                )
+                helper_next = gr.Button(i18n("下一页"))
+            with gr.Row():
+                helper_add = gr.Button(i18n("新增一行"))
+                helper_remove = gr.Button(i18n("删除末行"))
+            helper_row_outputs = []
+            helper_row_values = []
+            for helper_slot in range(MULTISPEAKER_PAGE_SIZE):
+                with gr.Row():
+                    helper_path = gr.Textbox(
+                        label=i18n("训练集子音频文件夹目录路径"),
+                        value="",
+                        visible=helper_slot < 2,
+                    )
+                    helper_speaker_name = gr.Textbox(
+                        label=i18n("说话人名称"),
+                        value="",
+                        visible=helper_slot < 2,
+                    )
+                    helper_speaker_id = gr.Number(
+                        label=i18n("说话人ID（0~109）"),
+                        value=helper_slot if helper_slot < 2 else None,
+                        precision=0,
+                        visible=helper_slot < 2,
+                    )
+                    helper_repeat = gr.Number(
+                        label=i18n("重复次数"),
+                        value=1 if helper_slot < 2 else None,
+                        precision=0,
+                        visible=helper_slot < 2,
+                    )
+                helper_row_outputs.extend(
+                    [
+                        helper_path,
+                        helper_speaker_name,
+                        helper_speaker_id,
+                        helper_repeat,
+                    ]
+                )
+                helper_row_values.extend(
+                    [helper_path, helper_speaker_name, helper_speaker_id, helper_repeat]
+                )
+            helper_status = gr.HTML(value="")
+            helper_event_inputs = [
+                helper_rows_state,
+                helper_row_count,
+                helper_page,
+            ] + helper_row_values
+            helper_event_outputs = [
+                helper_rows_state,
+                helper_row_count,
+                helper_page,
+                helper_page_label,
+            ] + helper_row_outputs
+            helper_add.click(
+                add_multispeaker_row,
+                helper_event_inputs,
+                helper_event_outputs,
+                queue=False,
+            )
+            helper_remove.click(
+                remove_multispeaker_row,
+                helper_event_inputs,
+                helper_event_outputs,
+                queue=False,
+            )
+            helper_previous.click(
+                previous_multispeaker_page,
+                helper_event_inputs,
+                helper_event_outputs,
+                queue=False,
+            )
+            helper_next.click(
+                next_multispeaker_page,
+                helper_event_inputs,
+                helper_event_outputs,
+                queue=False,
+            )
+            helper_submit.click(
+                submit_multispeaker_rows,
+                [helper_exp_name] + helper_event_inputs,
+                [helper_rows_state, helper_status],
+                api_name="multispeaker_manifest_submit",
+            )
+            exp_dir1.change(
+                sync_exp_name,
+                [exp_dir1, helper_exp_name],
+                [helper_exp_name],
+                queue=False,
+            )
+            helper_exp_name.change(
+                sync_exp_name,
+                [helper_exp_name, exp_dir1],
+                [exp_dir1],
+                queue=False,
+            )
 
         with gr.TabItem(i18n("ckpt处理")):
             with gr.Group():

@@ -106,6 +106,27 @@ class EpochRecorder:
         return f"[{current_time}] | ({elapsed_time_str})"
 
 
+def load_pretrained_generator(model, path):
+    target = model.module if hasattr(model, "module") else model
+    saved_state = torch.load(path, map_location="cpu")["model"]
+    current_state = target.state_dict()
+    embedding_key = "emb_g.weight"
+    if embedding_key in saved_state and embedding_key in current_state:
+        saved_embedding = saved_state[embedding_key]
+        current_embedding = current_state[embedding_key]
+        if saved_embedding.shape != current_embedding.shape:
+            compatible = (
+                saved_embedding.dim() == current_embedding.dim()
+                and saved_embedding.shape[1:] == current_embedding.shape[1:]
+            )
+            if compatible:
+                expanded = current_embedding.clone()
+                rows = min(saved_embedding.shape[0], current_embedding.shape[0])
+                expanded[:rows].copy_(saved_embedding[:rows])
+                saved_state[embedding_key] = expanded
+    return target.load_state_dict(saved_state)
+
+
 def main():
     n_gpus = torch.cuda.device_count()
     single_cuda = torch.cuda.is_available() and n_gpus == 1
@@ -242,18 +263,7 @@ def run(rank, n_gpus, hps, logger, use_ddp):
         if hps.pretrainG != "":
             if rank == 0:
                 logger.info(i18n("已加载生成器预训练模型：%s") % hps.pretrainG)
-            if hasattr(net_g, "module"):
-                logger.info(
-                    net_g.module.load_state_dict(
-                        torch.load(hps.pretrainG, map_location="cpu")["model"]
-                    )
-                )  ##测试不加载优化器
-            else:
-                logger.info(
-                    net_g.load_state_dict(
-                        torch.load(hps.pretrainG, map_location="cpu")["model"]
-                    )
-                )  ##测试不加载优化器
+            logger.info(load_pretrained_generator(net_g, hps.pretrainG))
         if hps.pretrainD != "":
             if rank == 0:
                 logger.info(i18n("已加载判别器预训练模型：%s") % hps.pretrainD)

@@ -1,13 +1,31 @@
 import os
 import sys
 import traceback
+import json
 from collections import OrderedDict
 
 import torch
 
 from i18n.i18n import I18nAuto
+from tools.file_io import read_text
 
 i18n = I18nAuto()
+
+
+def normalize_speaker_info(speaker_info):
+    result = []
+    seen = set()
+    for item in speaker_info or []:
+        try:
+            speaker_id = int(item["id"])
+            speaker_name = str(item["name"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if speaker_id < 0 or speaker_id > 109 or not speaker_name or speaker_id in seen:
+            continue
+        seen.add(speaker_id)
+        result.append({"id": speaker_id, "name": speaker_name})
+    return sorted(result, key=lambda item: item["id"])
 
 
 def savee(ckpt, sr, if_f0, name, epoch, version, hps):
@@ -42,6 +60,9 @@ def savee(ckpt, sr, if_f0, name, epoch, version, hps):
         opt["sr"] = sr
         opt["f0"] = if_f0
         opt["version"] = version
+        speaker_info = normalize_speaker_info(getattr(hps, "speaker_info", []))
+        if speaker_info:
+            opt["speaker_info"] = speaker_info
         torch.save(opt, "assets/weights/%s.pth" % name)
         return i18n("成功")
     except:
@@ -63,6 +84,11 @@ def show_info(path):
 
 def extract_small_model(path, name, sr, if_f0, info, version):
     try:
+        speaker_info = []
+        config_path = os.path.join(os.path.dirname(os.path.abspath(path)), "config.json")
+        if os.path.isfile(config_path):
+            config_data = json.loads(read_text(config_path))
+            speaker_info = normalize_speaker_info(config_data.get("speaker_info", []))
         ckpt = torch.load(path, map_location="cpu")
         if "model" in ckpt:
             ckpt = ckpt["model"]
@@ -185,6 +211,8 @@ def extract_small_model(path, name, sr, if_f0, info, version):
         opt["version"] = version
         opt["sr"] = sr
         opt["f0"] = int(if_f0)
+        if speaker_info:
+            opt["speaker_info"] = speaker_info
         torch.save(opt, "assets/weights/%s.pth" % name)
         return i18n("成功")
     except:
@@ -218,6 +246,8 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
 
         ckpt1 = torch.load(path1, map_location="cpu")
         ckpt2 = torch.load(path2, map_location="cpu")
+        speaker_info1 = normalize_speaker_info(ckpt1.get("speaker_info", []))
+        speaker_info2 = normalize_speaker_info(ckpt2.get("speaker_info", []))
         cfg = ckpt1["config"]
         if "model" in ckpt1:
             ckpt1 = extract(ckpt1)
@@ -255,6 +285,8 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
         opt["f0"] = 1 if f0 == i18n("是") else 0
         opt["version"] = version
         opt["info"] = info
+        if speaker_info1 and speaker_info1 == speaker_info2:
+            opt["speaker_info"] = speaker_info1
         torch.save(opt, "assets/weights/%s.pth" % name)
         return i18n("成功")
     except:
